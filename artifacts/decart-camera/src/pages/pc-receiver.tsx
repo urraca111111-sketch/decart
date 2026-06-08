@@ -3,7 +3,7 @@ import {
   Monitor, Settings, Maximize2, Minimize2, Loader2, PhoneOff,
   Image, Sparkles, CheckCircle, AlertCircle, ArrowLeft,
   Eye, EyeOff, Upload, Trash2, RefreshCw, Video,
-  Code2, Zap
+  Code2, Zap, Volume2, VolumeX, Speaker, RotateCcw as RefreshDevices
 } from "lucide-react";
 import { Link } from "wouter";
 import { createDecartClient, models } from "@decartai/sdk";
@@ -28,6 +28,13 @@ export default function PcReceiver() {
   const [decartPhase, setDecartPhase] = useState<DecartPhase>("idle");
   const [decartMsg, setDecartMsg] = useState("");
   const [pythonJobId, setPythonJobId] = useState("");
+
+  // ── Audio output state ──
+  const [audioOutputs, setAudioOutputs] = useState<MediaDeviceInfo[]>([]);
+  const [selectedSinkId, setSelectedSinkId] = useState("default");
+  const [audioVolume, setAudioVolume] = useState(1.0);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
 
   // ── View state ──
   const [showFiltered, setShowFiltered] = useState(true);
@@ -57,6 +64,55 @@ export default function PcReceiver() {
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const icePollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const styleFileRef = useRef<HTMLInputElement>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const levelRafRef = useRef<number | null>(null);
+
+  // ── Audio output helpers ──
+  const loadAudioOutputs = useCallback(async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setAudioOutputs(devices.filter(d => d.kind === "audiooutput"));
+    } catch { /* ignore */ }
+  }, []);
+
+  const applyAudioSink = useCallback(async (sinkId: string) => {
+    setSelectedSinkId(sinkId);
+    const el = rawVideoRef.current as (HTMLVideoElement & { setSinkId?: (id: string) => Promise<void> }) | null;
+    if (el?.setSinkId) {
+      try { await el.setSinkId(sinkId); } catch { /* unsupported */ }
+    }
+  }, []);
+
+  const startAudioMeter = useCallback((stream: MediaStream) => {
+    if (levelRafRef.current) cancelAnimationFrame(levelRafRef.current);
+    if (audioCtxRef.current) { audioCtxRef.current.close(); audioCtxRef.current = null; }
+
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0) return;
+
+    try {
+      const ctx = new AudioContext();
+      audioCtxRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.7;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const tick = () => {
+        analyser.getByteTimeDomainData(data);
+        let sum = 0;
+        for (const v of data) sum += (v - 128) ** 2;
+        const rms = Math.sqrt(sum / data.length) / 128;
+        setAudioLevel(Math.min(1, rms * 6));
+        levelRafRef.current = requestAnimationFrame(tick);
+      };
+      levelRafRef.current = requestAnimationFrame(tick);
+    } catch { /* AudioContext blocked */ }
+  }, []);
 
   // ── Load saved config ──
   useEffect(() => {
@@ -72,6 +128,20 @@ export default function PcReceiver() {
       .then((d: { styleImage?: string }) => { if (d.styleImage) setStyleImage(d.styleImage); })
       .catch(() => {});
   }, []);
+
+  // ── Load audio output devices on mount + react to device changes ──
+  useEffect(() => {
+    loadAudioOutputs();
+    navigator.mediaDevices.addEventListener("devicechange", loadAudioOutputs);
+    return () => { navigator.mediaDevices.removeEventListener("devicechange", loadAudioOutputs); };
+  }, [loadAudioOutputs]);
+
+  // ── Sync volume/mute to rawVideoRef whenever they change ──
+  useEffect(() => {
+    if (rawVideoRef.current) {
+      rawVideoRef.current.volume = isMuted ? 0 : audioVolume;
+    }
+  }, [audioVolume, isMuted]);
 
   useEffect(() => {
     const onFs = () => setIsFullscreen(!!document.fullscreenElement);
@@ -338,6 +408,14 @@ export default function PcReceiver() {
             const videoEl = rawVideoRef.current;
             if (!videoEl) return;
 
+            // Start audio meter & re-apply sink/volume preferences
+            startAudioMeter(incomingStream);
+            const el = videoEl as HTMLVideoElement & { setSinkId?: (id: string) => Promise<void> };
+            if (el.setSinkId && selectedSinkId !== "default") {
+              try { await el.setSinkId(selectedSinkId); } catch { /* ignore */ }
+            }
+            videoEl.volume = isMuted ? 0 : audioVolume;
+
             // Video-only stream to Decart — audio plays exclusively through rawVideoRef
             const localStream = startCanvasBridge(videoEl);
 
@@ -406,6 +484,11 @@ export default function PcReceiver() {
     stopCanvasBridge();
     if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
     if (icePollingRef.current) { clearInterval(icePollingRef.current); icePollingRef.current = null; }
+    // Clean up audio meter
+    if (levelRafRef.current) { cancelAnimationFrame(levelRafRef.current); levelRafRef.current = null; }
+    if (audioCtxRef.current) { audioCtxRef.current.close(); audioCtxRef.current = null; }
+    analyserRef.current = null;
+    setAudioLevel(0);
     setIsConnected(false); setIsConnecting(false);
     setHasFilteredStream(false); setDecartPhase("idle"); setDecartMsg("");
     setRoomId(""); setRtcStatus("Listo para iniciar"); setRtcError("");
@@ -581,6 +664,95 @@ export default function PcReceiver() {
             <CheckCircle className="w-4 h-4" />
             {configSaved ? "✅ Guardado" : "Guardar configuración"}
           </button>
+
+          {/* ── Audio Output Section ── */}
+          <div className="space-y-3 border border-gray-700 rounded-xl p-3">
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-semibold text-gray-400 uppercase tracking-wide flex items-center gap-1.5">
+                <Speaker className="w-3.5 h-3.5 text-cyan-400" /> Salida de Audio
+              </label>
+              <button
+                onClick={loadAudioOutputs}
+                className="text-gray-500 hover:text-gray-300 p-1 rounded transition-colors"
+                title="Actualizar dispositivos"
+              >
+                <RefreshDevices className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {/* Device selector */}
+            <div className="space-y-1">
+              <select
+                value={selectedSinkId}
+                onChange={e => applyAudioSink(e.target.value)}
+                className="w-full bg-gray-800 text-white text-xs px-3 py-2 rounded-lg border border-gray-700 focus:border-cyan-500 focus:outline-none"
+              >
+                <option value="default">🔊 Predeterminado del sistema</option>
+                {audioOutputs.filter(d => d.deviceId !== "default" && d.deviceId !== "communications").map(d => (
+                  <option key={d.deviceId} value={d.deviceId}>
+                    {d.label || `Dispositivo ${d.deviceId.slice(0, 8)}`}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-gray-600">
+                Para WO Mic: selecciona <span className="text-cyan-400 font-medium">WO Mic Device</span> o usa un cable de audio virtual (VB-Cable)
+              </p>
+            </div>
+
+            {/* VU meter */}
+            <div className="space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-gray-500">Nivel de audio recibido</span>
+                {isConnected && audioLevel > 0.01 && (
+                  <span className="text-xs text-green-400 font-medium">● Activo</span>
+                )}
+                {isConnected && audioLevel <= 0.01 && (
+                  <span className="text-xs text-gray-600">○ Silencio</span>
+                )}
+              </div>
+              <div className="flex gap-0.5 h-4 items-end">
+                {Array.from({ length: 20 }, (_, i) => {
+                  const threshold = (i + 1) / 20;
+                  const active = audioLevel >= threshold;
+                  const color = i < 12 ? "bg-green-500" : i < 16 ? "bg-yellow-500" : "bg-red-500";
+                  return (
+                    <div
+                      key={i}
+                      className={`flex-1 rounded-sm transition-all duration-75 ${active ? color : "bg-gray-700"}`}
+                      style={{ height: `${40 + i * 3}%` }}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Volume control */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setIsMuted(!isMuted)}
+                className={`p-1.5 rounded transition-colors flex-shrink-0 ${isMuted ? "text-red-400 bg-red-900/30" : "text-gray-400 hover:text-white"}`}
+                title={isMuted ? "Activar audio" : "Silenciar"}
+              >
+                {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+              </button>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={isMuted ? 0 : audioVolume}
+                onChange={e => { setIsMuted(false); setAudioVolume(parseFloat(e.target.value)); }}
+                className="flex-1 accent-cyan-500"
+              />
+              <span className="text-xs text-gray-400 w-8 text-right tabular-nums">
+                {isMuted ? "0%" : `${Math.round(audioVolume * 100)}%`}
+              </span>
+            </div>
+
+            <p className="text-xs text-gray-600 leading-relaxed">
+              💡 <strong className="text-gray-500">Cómo enrutar a WO Mic:</strong> instala WO Mic en PC → selecciona "WO Mic Device" arriba → el audio del celular saldrá como micrófono virtual en Zoom/Meet/Discord.
+            </p>
+          </div>
 
           {/* Room code — shown prominently when active */}
           {roomId && (
